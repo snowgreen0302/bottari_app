@@ -19,13 +19,11 @@ jobs:
           channel: 'stable'
 
       - name: 3. Inject Gemini API Key from GitHub Secret
+        env:
+          SECRET_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           mkdir -p lib/config
-          cat << 'EOF' > lib/config/api_keys.dart
-          class ApiKeys {
-            static const String geminiApiKey = '${{ secrets.GEMINI_API_KEY }}';
-          }
-          EOF
+          printf "class ApiKeys {\n  static const String geminiApiKey = '%s';\n}\n" "$SECRET_KEY" > lib/config/api_keys.dart
 
       - name: 4. Install Dependencies
         run: flutter pub get
