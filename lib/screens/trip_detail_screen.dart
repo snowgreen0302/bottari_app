@@ -6,9 +6,11 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 
 import '../models/trip_model.dart';
 import '../services/ai_service.dart';
+import '../services/poster_saver.dart';
 import '../services/storage_service.dart';
 import '../services/weather_service.dart';
 import '../widgets/route_map_widget.dart';
@@ -28,6 +30,9 @@ class _TripDetailScreenState extends State {
   bool _isClassifyingItem = false;
   bool _isGeocodingPlace = false;
   int? _selectedStopIndex;
+
+  // 포스터 캡처 시 CORS 보안 에러가 나지 않도록 지도 타일 바이트를 캐싱합니다.
+  final Map _tileBytesCache = {};
 
   @override
   TripDetailScreen get widget => super.widget as TripDetailScreen;
@@ -95,6 +100,31 @@ class _TripDetailScreenState extends State {
     return uri.toString();
   }
 
+  /// 웹 환경에서도 RepaintBoundary 캡처가 100% 성공하도록 지도 타일을 바이트로 미리 받아옵니다.
+  Future _preloadPosterMapTiles(int zoom, int baseTileX, int baseTileY) async {
+    final List futures = [];
+    for (int dx = -2; dx <= 2; dx++) {
+      for (int dy = -1; dy <= 1; dy++) {
+        final String url = _buildTileUrl(zoom, baseTileX + dx, baseTileY + dy);
+        if (!_tileBytesCache.containsKey(url)) {
+          futures.add(() async {
+            try {
+              final resp = await http
+                  .get(Uri.parse(url))
+                  .timeout(const Duration(seconds: 4));
+              if (resp.statusCode == 200) {
+                _tileBytesCache[url] = resp.bodyBytes;
+              }
+            } catch (_) {}
+          }());
+        }
+      }
+    }
+    if (futures.isNotEmpty) {
+      await Future.wait(futures.cast());
+    }
+  }
+
   List _getSafeLatLng(ScheduleItem item) {
     final List base = WeatherService.getBaseCoords(_trip.destination);
     final double baseLat = (base[0] as num).toDouble();
@@ -130,7 +160,7 @@ class _TripDetailScreenState extends State {
     return null;
   }
 
-  Widget _buildPosterRealMapSection() {
+  Map _computePosterMapMeta() {
     final List base = WeatherService.getBaseCoords(_trip.destination);
     final List? stayCoords = _findStayLatLngInTrip();
     double minLat = 999.0;
@@ -181,8 +211,24 @@ class _TripDetailScreenState extends State {
 
     final double centerTileX = _lonToTileX(centerLng, zoom);
     final double centerTileY = _latToTileY(centerLat, zoom);
-    final int baseTileX = centerTileX.floor();
-    final int baseTileY = centerTileY.floor();
+
+    return {
+      'zoom': zoom,
+      'centerTileX': centerTileX,
+      'centerTileY': centerTileY,
+      'baseTileX': centerTileX.floor(),
+      'baseTileY': centerTileY.floor(),
+      'stayCoords': stayCoords,
+    };
+  }
+
+  Widget _buildPosterRealMapSection(Map mapMeta) {
+    final int zoom = mapMeta['zoom'] as int;
+    final double centerTileX = mapMeta['centerTileX'] as double;
+    final double centerTileY = mapMeta['centerTileY'] as double;
+    final int baseTileX = mapMeta['baseTileX'] as int;
+    final int baseTileY = mapMeta['baseTileY'] as int;
+    final List? stayCoords = mapMeta['stayCoords'] as List?;
 
     return Container(
       width: double.infinity,
@@ -249,11 +295,25 @@ class _TripDetailScreenState extends State {
                       top: baseTop + dy * 256.0,
                       width: 256.0,
                       height: 256.0,
-                      child: Image.network(
-                        _buildTileUrl(zoom, baseTileX + dx, baseTileY + dy),
-                        fit: BoxFit.fill,
-                        errorBuilder: (_, __, ___) =>
-                            Container(color: const Color(0xFFEAF2EF)),
+                      child: Builder(
+                        builder: (_) {
+                          final String url = _buildTileUrl(
+                            zoom,
+                            baseTileX + dx,
+                            baseTileY + dy,
+                          );
+                          final Uint8List? cached =
+                              _tileBytesCache[url] as Uint8List?;
+                          if (cached != null) {
+                            return Image.memory(cached, fit: BoxFit.fill);
+                          }
+                          return Image.network(
+                            url,
+                            fit: BoxFit.fill,
+                            errorBuilder: (_, __, ___) =>
+                                Container(color: const Color(0xFFEAF2EF)),
+                          );
+                        },
                       ),
                     ),
                 Positioned.fill(
@@ -302,6 +362,7 @@ class _TripDetailScreenState extends State {
     );
   }
 
+  /// 팝업을 열자마자 자동으로 고화질 PNG를 생성해 두고, 하단 [사진 다운로드] 버튼으로 즉시 저장합니다.
   Future _showShareRouteCardDialog() async {
     if (_trip.scheduleList.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -312,7 +373,15 @@ class _TripDetailScreenState extends State {
 
     final GlobalKey boundaryKey = GlobalKey();
     Uint8List? capturedBytes;
-    bool isCapturing = false;
+    bool isDownloading = false;
+    bool autoCaptureStarted = false;
+
+    final Map mapMeta = _computePosterMapMeta();
+    await _preloadPosterMapTiles(
+      mapMeta['zoom'] as int,
+      mapMeta['baseTileX'] as int,
+      mapMeta['baseTileY'] as int,
+    );
 
     final Map groupedByDay = {};
     for (int i = 0; i < _trip.scheduleList.length; i++) {
@@ -327,243 +396,232 @@ class _TripDetailScreenState extends State {
     }
     final List sortedDays = groupedByDay.keys.toList()..sort();
 
+    if (!mounted) return;
+
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setModalState) => Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 20,
-          ),
-          child: Container(
-            constraints: const BoxConstraints(maxWidth: 460, maxHeight: 780),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF4F6F4),
-              borderRadius: BorderRadius.circular(24),
+        builder: (ctx, setModalState) {
+          // 팝업이 열리자마자 자동으로 고화질 이미지로 구워둡니다.
+          if (!autoCaptureStarted) {
+            autoCaptureStarted = true;
+            Future.delayed(const Duration(milliseconds: 280), () async {
+              try {
+                final BuildContext? bCtx = boundaryKey.currentContext;
+                if (bCtx != null) {
+                  final RenderRepaintBoundary boundary =
+                      bCtx.findRenderObject() as RenderRepaintBoundary;
+                  final ui.Image image = await boundary.toImage(
+                    pixelRatio: 2.5,
+                  );
+                  final ByteData? byteData = await image.toByteData(
+                    format: ui.ImageByteFormat.png,
+                  );
+                  if (byteData != null && ctx.mounted) {
+                    setModalState(() {
+                      capturedBytes = byteData.buffer.asUint8List();
+                    });
+                  }
+                }
+              } catch (_) {}
+            });
+          }
+
+          return Dialog(
+            backgroundColor: Colors.transparent,
+            insetPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 20,
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 14, 12, 8),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.photo_camera_back_rounded,
-                        color: Color(0xFF006B3E),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          capturedBytes == null
-                              ? '공유용 한 장 동선 포스터'
-                              : '고화질 동선 이미지 변환 완료!',
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w800,
-                            fontSize: 15.5,
-                          ),
+            child: Container(
+              constraints: const BoxConstraints(maxWidth: 460, maxHeight: 780),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF4F6F4),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 14, 12, 8),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.photo_camera_back_rounded,
+                          color: Color(0xFF006B3E),
                         ),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.close_rounded),
-                        onPressed: () => Navigator.pop(ctx),
-                      ),
-                    ],
-                  ),
-                ),
-                const Divider(height: 1),
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
-                    child: capturedBytes != null
-                        ? Column(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 8,
-                                ),
-                                margin: const EdgeInsets.only(bottom: 12),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF006B3E)
-                                      .withOpacity(0.1),
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: const Row(
-                                  children: [
-                                    Icon(
-                                      Icons.check_circle_rounded,
-                                      size: 18,
-                                      color: Color(0xFF006B3E),
-                                    ),
-                                    SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        '아래 이미지를 우클릭(모바일은 길게 터치)하여 사진으로 저장하거나 카카오톡에 바로 붙여넣으세요!',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w700,
-                                          color: Color(0xFF006B3E),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(18),
-                                child: Image.memory(
-                                  capturedBytes!,
-                                  fit: BoxFit.contain,
-                                ),
-                              ),
-                            ],
-                          )
-                        : RepaintBoundary(
-                            key: boundaryKey,
-                            child: _buildPosterCardWidget(
-                              sortedDays,
-                              groupedByDay,
-                            ),
-                          ),
-                  ),
-                ),
-                const Divider(height: 1),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFF006B3E),
-                            side: const BorderSide(color: Color(0xFF006B3E)),
-                            padding: const EdgeInsets.symmetric(vertical: 13),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                          ),
-                          onPressed: () async {
-                            final String textSummary = _buildShareTextSummary(
-                              sortedDays,
-                              groupedByDay,
-                            );
-                            await Clipboard.setData(
-                              ClipboardData(text: textSummary),
-                            );
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text('일정 요약 텍스트가 클립보드에 복사되었습니다!'),
-                                  backgroundColor: Color(0xFF006B3E),
-                                ),
-                              );
-                            }
-                          },
-                          icon: const Icon(Icons.copy_rounded, size: 18),
-                          label: const Text(
-                            '카톡 텍스트 복사',
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            '고화질 동선 이미지 변환 완료!',
                             style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              fontSize: 15.5,
                             ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: FilledButton.icon(
-                          style: FilledButton.styleFrom(
-                            backgroundColor: const Color(0xFF006B3E),
-                            padding: const EdgeInsets.symmetric(vertical: 13),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                          ),
-                          onPressed: isCapturing
-                              ? null
-                              : () async {
-                                  if (capturedBytes != null) {
-                                    setModalState(() => capturedBytes = null);
-                                    return;
-                                  }
-                                  setModalState(() => isCapturing = true);
-                                  try {
-                                    await Future.delayed(
-                                      const Duration(milliseconds: 120),
-                                    );
-                                    final RenderRepaintBoundary boundary =
-                                        boundaryKey.currentContext!
-                                                .findRenderObject()
-                                            as RenderRepaintBoundary;
-                                    final ui.Image image = await boundary
-                                        .toImage(pixelRatio: 2.5);
-                                    final ByteData? byteData = await image
-                                        .toByteData(
-                                          format: ui.ImageByteFormat.png,
-                                        );
-                                    if (byteData != null) {
-                                      setModalState(() {
-                                        capturedBytes = byteData.buffer
-                                            .asUint8List();
-                                        isCapturing = false;
-                                      });
-                                    } else {
-                                      setModalState(() => isCapturing = false);
-                                    }
-                                  } catch (_) {
-                                    setModalState(() => isCapturing = false);
-                                    if (mounted) {
-                                      ScaffoldMessenger.of(context)
-                                          .showSnackBar(
-                                            const SnackBar(
-                                              content: Text(
-                                                '웹 브라우저 보안 정책으로 인해 현재 포스터 화면을 바로 캡처(Win+Shift+S)하여 공유해주세요!',
-                                              ),
-                                            ),
-                                          );
-                                    }
-                                  }
-                                },
-                          icon: isCapturing
-                              ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.white,
-                                  ),
-                                )
-                              : Icon(
-                                  capturedBytes == null
-                                      ? Icons.camera_alt_rounded
-                                      : Icons.refresh_rounded,
-                                  size: 18,
-                                ),
-                          label: Text(
-                            capturedBytes == null
-                                ? '한 장 이미지로 변환'
-                                : '포스터 화면으로 보기',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                            ),
-                          ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded),
+                          onPressed: () => Navigator.pop(ctx),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                  const Divider(height: 1),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(16),
+                      child: RepaintBoundary(
+                        key: boundaryKey,
+                        child: _buildPosterCardWidget(
+                          sortedDays,
+                          groupedByDay,
+                          mapMeta,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFF006B3E),
+                              side: const BorderSide(color: Color(0xFF006B3E)),
+                              padding: const EdgeInsets.symmetric(vertical: 13),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            onPressed: () async {
+                              final String textSummary = _buildShareTextSummary(
+                                sortedDays,
+                                groupedByDay,
+                              );
+                              await Clipboard.setData(
+                                ClipboardData(text: textSummary),
+                              );
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('일정 요약 텍스트가 클립보드에 복사되었습니다!'),
+                                    backgroundColor: Color(0xFF006B3E),
+                                  ),
+                                );
+                              }
+                            },
+                            icon: const Icon(Icons.copy_rounded, size: 18),
+                            label: const Text(
+                              '카톡 텍스트 복사',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: const Color(0xFF006B3E),
+                              padding: const EdgeInsets.symmetric(vertical: 13),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            onPressed: isDownloading
+                                ? null
+                                : () async {
+                                    setModalState(() => isDownloading = true);
+                                    try {
+                                      if (capturedBytes == null) {
+                                        final RenderRepaintBoundary boundary =
+                                            boundaryKey.currentContext!
+                                                    .findRenderObject()
+                                                as RenderRepaintBoundary;
+                                        final ui.Image image = await boundary
+                                            .toImage(pixelRatio: 2.5);
+                                        final ByteData? byteData = await image
+                                            .toByteData(
+                                              format: ui.ImageByteFormat.png,
+                                            );
+                                        if (byteData != null) {
+                                          capturedBytes = byteData.buffer
+                                              .asUint8List();
+                                        }
+                                      }
+
+                                      if (capturedBytes != null) {
+                                        final String safeFileName =
+                                            '${_trip.destination}_보따리_동선표.png';
+                                        final bool ok =
+                                            await triggerPosterDownload(
+                                              capturedBytes!,
+                                              safeFileName,
+                                            );
+                                        if (mounted) {
+                                          ScaffoldMessenger.of(context)
+                                              .showSnackBar(
+                                                SnackBar(
+                                                  content: Text(
+                                                    ok
+                                                        ? '📥 동선 포스터 사진 다운로드가 시작되었습니다!'
+                                                        : '이미지가 생성되었습니다!',
+                                                  ),
+                                                  backgroundColor: const Color(
+                                                    0xFF006B3E,
+                                                  ),
+                                                ),
+                                              );
+                                        }
+                                      }
+                                    } catch (_) {}
+                                    if (ctx.mounted) {
+                                      setModalState(
+                                        () => isDownloading = false,
+                                      );
+                                    }
+                                  },
+                            icon: isDownloading
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.download_rounded, size: 19),
+                            label: const Text(
+                              '사진 다운로드',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }
 
-  Widget _buildPosterCardWidget(List sortedDays, Map groupedByDay) {
+  Widget _buildPosterCardWidget(
+    List sortedDays,
+    Map groupedByDay,
+    Map mapMeta,
+  ) {
     final String stayLabel = _trip.accommodation.trim().isEmpty
         ? '${_trip.destination} 거점 숙소'
         : _trip.accommodation.trim();
@@ -685,7 +743,7 @@ class _TripDetailScreenState extends State {
                             const SizedBox(width: 6),
                             Expanded(
                               child: Text(
-                                '거점 숙소: ${_trip.accommodation}',
+                                '거점 숙소: ${_trip.accommodation} (체크인 ${_trip.checkInTime})',
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 11.5,
@@ -702,9 +760,7 @@ class _TripDetailScreenState extends State {
               ],
             ),
           ),
-
-          _buildPosterRealMapSection(),
-
+          _buildPosterRealMapSection(mapMeta),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 18),
             child: Column(
@@ -742,7 +798,6 @@ class _TripDetailScreenState extends State {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  // 2일차 이상 시작 시 '숙소 출발' 안내 배지 자동 표시
                   if ((dayObj as int) >= 2)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 8),
@@ -863,7 +918,7 @@ class _TripDetailScreenState extends State {
     final StringBuffer sb = StringBuffer();
     sb.writeln('🎒 [${_trip.title}] 여행 동선표');
     sb.writeln('📍 목적지: ${_trip.destination}');
-    sb.writeln('🏨 거점 숙소: $stayLabel');
+    sb.writeln('🏨 거점 숙소: $stayLabel (체크인 ${_trip.checkInTime})');
     sb.writeln('☀️ 날씨: ${_trip.weatherSummary}');
     sb.writeln('');
 
@@ -1214,7 +1269,9 @@ class _TripDetailScreenState extends State {
 
   Widget _buildWeatherAndProgressHeader() {
     final int percent = (_trip.packingProgress * 100).round();
-    final int checkedCount = _trip.packingList.where((e) => e.isChecked).length;
+    final int checkedCount = _trip.packingList
+        .where((e) => (e as PackingItem).isChecked)
+        .length;
 
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 8, 16, 12),
@@ -1258,7 +1315,7 @@ class _TripDetailScreenState extends State {
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    '숙소 거점: ${_trip.accommodation}',
+                    '숙소 거점: ${_trip.accommodation} (체크인 ${_trip.checkInTime})',
                     style: const TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w600,
@@ -1309,7 +1366,8 @@ class _TripDetailScreenState extends State {
 
   Widget _buildChecklistView() {
     final Map grouped = {};
-    for (final PackingItem item in _trip.packingList) {
+    for (final dynamic raw in _trip.packingList) {
+      final PackingItem item = raw as PackingItem;
       if (!grouped.containsKey(item.category)) {
         grouped[item.category] = [];
       }
@@ -1411,7 +1469,7 @@ class _TripDetailScreenState extends State {
                                 onDismissed: (_) async {
                                   setState(() {
                                     _trip.packingList.removeWhere(
-                                      (e) => e.id == item.id,
+                                      (e) => (e as PackingItem).id == item.id,
                                     );
                                   });
                                   await _saveChanges();
@@ -1462,7 +1520,8 @@ class _TripDetailScreenState extends State {
                                     onPressed: () async {
                                       setState(() {
                                         _trip.packingList.removeWhere(
-                                          (e) => e.id == item.id,
+                                          (e) =>
+                                              (e as PackingItem).id == item.id,
                                         );
                                       });
                                       await _saveChanges();
@@ -1553,13 +1612,17 @@ class _TripDetailScreenState extends State {
                   onReorder: (oldIndex, newIndex) async {
                     setState(() {
                       final List currentSlots = _trip.scheduleList
-                          .map((s) => {'day': s.day, 'time': s.time})
+                          .map(
+                            (s) => {
+                              'day': (s as ScheduleItem).day,
+                              'time': s.time,
+                            },
+                          )
                           .toList();
 
                       if (newIndex > oldIndex) newIndex -= 1;
-                      final ScheduleItem moved = _trip.scheduleList.removeAt(
-                        oldIndex,
-                      );
+                      final ScheduleItem moved =
+                          _trip.scheduleList.removeAt(oldIndex) as ScheduleItem;
                       _trip.scheduleList.insert(newIndex, moved);
 
                       _realignScheduleDaysAndTimes(currentSlots);
@@ -1577,7 +1640,8 @@ class _TripDetailScreenState extends State {
                     }
                   },
                   itemBuilder: (context, index) {
-                    final ScheduleItem sched = _trip.scheduleList[index];
+                    final ScheduleItem sched =
+                        _trip.scheduleList[index] as ScheduleItem;
                     final bool isSelected = _selectedStopIndex == index;
                     final Color badgeColor = _dayColor(sched.day);
 
@@ -1601,7 +1665,8 @@ class _TripDetailScreenState extends State {
                         setState(() {
                           _trip.scheduleList.removeAt(index);
                           for (int i = 0; i < _trip.scheduleList.length; i++) {
-                            _trip.scheduleList[i].orderIndex = i;
+                            (_trip.scheduleList[i] as ScheduleItem).orderIndex =
+                                i;
                           }
                         });
                         await _saveChanges();
@@ -1725,7 +1790,9 @@ class _TripDetailScreenState extends State {
                                       i < _trip.scheduleList.length;
                                       i++
                                     ) {
-                                      _trip.scheduleList[i].orderIndex = i;
+                                      (_trip.scheduleList[i] as ScheduleItem)
+                                              .orderIndex =
+                                          i;
                                     }
                                     if (_selectedStopIndex == index) {
                                       _selectedStopIndex = null;
@@ -1826,7 +1893,7 @@ class _PosterMapPinPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final Paint linePaint = Paint()
-      ..color = dayColorFromColor(color)
+      ..color = color
       ..strokeWidth = 3.2
       ..strokeCap = StrokeCap.round
       ..style = PaintingStyle.stroke;
@@ -1835,13 +1902,10 @@ class _PosterMapPinPainter extends CustomPainter {
     canvas.drawLine(p1, p2, linePaint);
   }
 
-  Color dayColorFromColor(Color c) => c;
-
   @override
   void paint(Canvas canvas, Size size) {
     if (points.isEmpty) return;
 
-    // 동선 연결선 (일차가 바뀔 때 숙소(stayPoint)를 경유하도록 처리)
     for (int i = 0; i < points.length - 1; i++) {
       final ScheduleItem curr = scheduleList[i] as ScheduleItem;
       final ScheduleItem next = scheduleList[i + 1] as ScheduleItem;
@@ -1862,7 +1926,6 @@ class _PosterMapPinPainter extends CustomPainter {
       }
     }
 
-    // 숙소 거점 아이콘 핀
     if (stayPoint != null) {
       final Paint stayPaint = Paint()..color = const Color(0xFF1C1C1E);
       final Paint stayBorder = Paint()
@@ -1873,7 +1936,6 @@ class _PosterMapPinPainter extends CustomPainter {
       canvas.drawCircle(stayPoint!, 10.5, stayBorder);
     }
 
-    // 번호 원형 핀 그리기
     for (int i = 0; i < points.length; i++) {
       final ScheduleItem s = scheduleList[i] as ScheduleItem;
       final Offset pt = points[i] as Offset;
