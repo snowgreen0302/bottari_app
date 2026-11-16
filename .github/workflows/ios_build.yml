@@ -1,44 +1,46 @@
-name: Build iOS IPA (Unsigned)
+name: Build Un-signed iOS IPA
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build_ios:
+    name: Build iOS IPA on macOS
     runs-on: macos-latest
 
     steps:
-      - name: 1. Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Setup Flutter
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      - name: 3. Inject Gemini API Key from GitHub Secret
+      - name: Inject API Keys (Gemini & Kakao)
         env:
-          SECRET_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
+          KAKAO_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
         run: |
           mkdir -p lib/config
-          printf "class ApiKeys {\n  static const String geminiApiKey = '%s';\n}\n" "$SECRET_KEY" > lib/config/api_keys.dart
+          printf "class ApiKeys {\n  static const String geminiApiKey = '%s';\n  static const String kakaoRestApiKey = '%s';\n}\n" "$GEMINI_KEY" "$KAKAO_KEY" > lib/config/api_keys.dart
 
-      - name: 4. Install Dependencies
+      - name: Install Dependencies
         run: flutter pub get
 
-      - name: 5. Build iOS (No Codesign)
+      - name: Build Unsigned iOS Release
         run: flutter build ios --release --no-codesign
 
-      - name: 6. Package as .ipa
+      - name: Package .app into .ipa
         run: |
           mkdir -p Payload
           cp -r build/ios/iphoneos/Runner.app Payload/
-          zip -r -y Bottari_iOS.ipa Payload
+          zip -r -9 Bottari_Unsigned.ipa Payload
 
-      - name: 7. Upload IPA Artifact
+      - name: Upload .ipa Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Bottari-iOS-IPA
-          path: Bottari_iOS.ipa
+          name: Bottari_iOS_IPA
+          path: Bottari_Unsigned.ipa

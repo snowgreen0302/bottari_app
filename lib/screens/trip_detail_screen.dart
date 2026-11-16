@@ -70,11 +70,11 @@ class _TripDetailScreenState extends State {
     return '${targetDate.month}.${targetDate.day}($wk)';
   }
 
+  // 홀수 일차(Day 1, 3, 5...): 초록색 / 짝수 일차(Day 2, 4, 6...): 하늘색
   Color _dayColor(int day) {
-    if (day == 1) return const Color(0xFF006B3E);
-    if (day == 2) return const Color(0xFF0077B6);
-    if (day == 3) return const Color(0xFFD97706);
-    return const Color(0xFF7C3AED);
+    return (day % 2 == 1)
+        ? const Color(0xFF006B3E)
+        : const Color(0xFF0288D1);
   }
 
   double _lonToTileX(double lon, int zoom) {
@@ -130,11 +130,14 @@ class _TripDetailScreenState extends State {
     final double baseLat = (base[0] as num).toDouble();
     final double baseLng = (base[1] as num).toDouble();
 
-    if ((item.lat - baseLat).abs() > 1.2 || (item.lng - baseLng).abs() > 1.2) {
+    if (item.lat == 0.0 ||
+        item.lng == 0.0 ||
+        (item.lat - baseLat).abs() > 0.25 ||
+        (item.lng - baseLng).abs() > 0.25) {
       final int idx = item.orderIndex;
       return [
-        baseLat + ((idx % 3) - 1) * 0.008,
-        baseLng + ((idx % 4) - 1.5) * 0.010,
+        baseLat + ((idx % 3) - 1) * 0.004,
+        baseLng + ((idx % 4) - 1.5) * 0.005,
       ];
     }
     return [item.lat, item.lng];
@@ -402,7 +405,6 @@ class _TripDetailScreenState extends State {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setModalState) {
-          // 팝업이 열리자마자 자동으로 고화질 이미지로 구워둡니다.
           if (!autoCaptureStarted) {
             autoCaptureStarted = true;
             Future.delayed(const Duration(milliseconds: 280), () async {
@@ -803,18 +805,18 @@ class _TripDetailScreenState extends State {
                       padding: const EdgeInsets.only(bottom: 8),
                       child: Row(
                         children: [
-                          const Icon(
+                          Icon(
                             Icons.hotel_rounded,
                             size: 16,
-                            color: Color(0xFF0077B6),
+                            color: _dayColor(dayObj),
                           ),
                           const SizedBox(width: 6),
                           Text(
                             '오전 출발 거점: $stayLabel에서 출발',
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontSize: 11.5,
                               fontWeight: FontWeight.w800,
-                              color: Color(0xFF0077B6),
+                              color: _dayColor(dayObj),
                             ),
                           ),
                         ],
